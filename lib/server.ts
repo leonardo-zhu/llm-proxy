@@ -17,6 +17,10 @@ export interface ProxyRoute {
   /** 固定转发到指定路径，不设则剥掉前缀后原样转发 */
   targetPath?: string;
   transform?: Transform;
+  /** 非流式 response body 转换（Chat → Responses） */
+  responseTransform?: Transform;
+  /** 流式 SSE stream 转换器工厂，返回 TransformStream */
+  streamTransformer?: () => TransformStream<Uint8Array, Uint8Array>;
 }
 
 export interface ServerConfig {
@@ -71,11 +75,31 @@ export function startProxy(config: ServerConfig) {
           body: JSON.stringify(body),
         });
 
-        const respBody = await resp.arrayBuffer();
-        return new Response(respBody, {
+        const contentType = resp.headers.get("Content-Type") ?? "";
+
+        // 流式响应：SSE stream 转换
+        if (contentType.includes("text/event-stream") && route.streamTransformer && resp.body) {
+          console.log(`[proxy] ← SSE stream, applying stream transformer`);
+          return new Response(resp.body.pipeThrough(route.streamTransformer()), {
+            status: resp.status,
+            headers: {
+              "Content-Type": "text/event-stream",
+              "Cache-Control": "no-cache",
+              Connection: "keep-alive",
+            },
+          });
+        }
+
+        // 非流式响应：JSON body 转换
+        const respBody = await resp.json();
+        const transformed = route.responseTransform
+          ? route.responseTransform(respBody as Record<string, unknown>)
+          : respBody;
+
+        return Response.json(transformed, {
           status: resp.status,
           headers: {
-            "Content-Type": resp.headers.get("Content-Type") ?? "application/json",
+            "Content-Type": "application/json",
           },
         });
       } catch (e) {
