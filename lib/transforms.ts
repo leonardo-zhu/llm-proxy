@@ -114,13 +114,25 @@ function normalizeContent(content: unknown): unknown {
  */
 export function responsesToChat(): Transform {
   return (body) => {
-    const { input, instructions, tools, max_output_tokens, ...rest } =
-      body as Body & { input?: unknown[]; instructions?: string; tools?: unknown[]; max_output_tokens?: number };
+    const { input, instructions, tools, max_output_tokens, text, ...rest } =
+      body as Body & { input?: unknown[] | string; instructions?: string; tools?: unknown[]; max_output_tokens?: number; text?: Record<string, unknown> };
 
     const result: Body = { ...rest };
 
     // max_output_tokens → max_tokens
     if (max_output_tokens != null) result.max_tokens = max_output_tokens;
+
+    // text.format → response_format
+    if (text && typeof text === "object") {
+      const format = (text as Record<string, unknown>).format;
+      if (format && typeof format === "object") {
+        const fmt = format as Record<string, unknown>;
+        if (fmt.type === "json_schema") {
+          result.response_format = { type: "json_schema", json_schema: fmt };
+        }
+        // type:"text" 不需要设置 response_format
+      }
+    }
 
     // tools 格式转换
     if (Array.isArray(tools) && tools.length > 0) {
@@ -134,7 +146,15 @@ export function responsesToChat(): Transform {
       });
     }
 
-    if (!Array.isArray(input)) return result;
+    // input: string → array
+    let inputItems: unknown[];
+    if (typeof input === "string") {
+      inputItems = [{ role: "user", content: input }];
+    } else if (Array.isArray(input)) {
+      inputItems = input;
+    } else {
+      return result;
+    }
 
     const messages: unknown[] = [];
 
@@ -143,7 +163,7 @@ export function responsesToChat(): Transform {
       messages.push({ role: "system", content: instructions });
     }
 
-    for (const item of input) {
+    for (const item of inputItems) {
       if (typeof item !== "object" || item === null) continue;
       const it = item as Record<string, unknown>;
 
@@ -175,6 +195,378 @@ export function responsesToChat(): Transform {
     result.messages = messages;
     return result;
   };
+}
+
+/**
+ * Chat Completions 格式 → Responses API 格式（非流式）
+ *
+ * - choices[0].message.content → output[] message item
+ * - choices[0].message.tool_calls → output[] function_call items
+ * - usage 映射
+ * - id 格式转换
+ */
+export function chatToResponses(): Transform {
+  return (body) => {
+    const chat = body as Record<string, unknown>;
+    const choices = chat.choices as Array<Record<string, unknown>> | undefined;
+    const choice = choices?.[0];
+    const message = choice?.message as Record<string, unknown> | undefined;
+    const usage = chat.usage as Record<string, unknown> | undefined;
+
+    // id: chatcmpl-xxx → resp-xxx
+    let respId = String(chat.id ?? "");
+    if (respId.startsWith("chatcmpl-")) {
+      respId = "resp-" + respId.slice("chatcmpl-".length);
+    } else if (!respId.startsWith("resp-")) {
+      respId = "resp-" + respId;
+    }
+
+    const output: Record<string, unknown>[] = [];
+    let msgIdx = 0;
+    let fcIdx = 0;
+
+    if (message) {
+      // content → message item
+      const content = message.content;
+      if (content != null && content !== "") {
+        const contentText = typeof content === "string" ? content : JSON.stringify(content);
+        output.push({
+          id: `msg-${respId}-${msgIdx++}`,
+          type: "message",
+          status: "completed",
+          role: "assistant",
+          content: [{ type: "output_text", text: contentText }],
+        });
+      }
+
+      // tool_calls → function_call items
+      const toolCalls = message.tool_calls as Array<Record<string, unknown>> | undefined;
+      if (Array.isArray(toolCalls)) {
+        for (const tc of toolCalls) {
+          const fn = tc.function as Record<string, unknown> | undefined;
+          output.push({
+            id: `fc-${respId}-${fcIdx++}`,
+            type: "function_call",
+            status: "completed",
+            call_id: tc.id,
+            name: fn?.name ?? "",
+            arguments: fn?.arguments ?? "{}",
+          });
+        }
+      }
+    }
+
+    // finish_reason → status
+    const finishReason = choice?.finish_reason as string | undefined;
+    let status = "completed";
+    if (finishReason === "length") status = "incomplete";
+
+    // usage 映射
+    let respUsage: Record<string, unknown> | undefined;
+    if (usage) {
+      respUsage = {
+        input_tokens: usage.prompt_tokens ?? 0,
+        output_tokens: usage.completion_tokens ?? 0,
+        total_tokens: usage.total_tokens ?? 0,
+      };
+    }
+
+    return {
+      id: respId,
+      object: "response",
+      created_at: chat.created ?? Math.floor(Date.now() / 1000),
+      model: chat.model ?? "",
+      status,
+      output,
+      ...(respUsage ? { usage: respUsage } : {}),
+    };
+  };
+}
+
+/**
+ * Chat Completions SSE stream → Responses API SSE stream
+ * 用 TransformStream 实现，pipeThrough 到 fetch response body
+ */
+export function createChatToResponsesSSETransformer(): TransformStream<Uint8Array, Uint8Array> {
+  const encoder = new TextEncoder();
+  const decoder = new TextDecoder();
+
+  // 状态
+  let responseId = "";
+  let model = "";
+  let createdAt = 0;
+  let buffer = "";
+  let outputIndex = 0;
+  let inToolCalls = false;
+
+  // 追踪并行 tool_calls: index → {id, name, arguments}
+  const pendingToolCalls = new Map<number, { id: string; name: string; arguments: string }>();
+  const completedItems: Record<string, unknown>[] = [];
+
+  // tool_call index → output_index 映射（修正 bug：每个 tool_call 使用固定 output_index）
+  const tcOutputIndex = new Map<number, number>();
+  let tcOutputIdxCounter = 0;
+
+  // ID 生成
+  let msgCounter = 0;
+  let fcCounter = 0;
+  const genMsgId = () => `msg-${responseId}-${msgCounter++}`;
+  const genFcId = () => `fc-${responseId}-${fcCounter++}`;
+
+  // 当前 message item 状态
+  let currentMsgId: string | null = null;
+  let currentMsgContent = "";
+  let msgContentEmitted = false;
+
+  function emitEvent(event: string, data: object): string {
+    return `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
+  }
+
+  function startMessageIfNeeded(): string {
+    let out = "";
+    if (currentMsgId === null) {
+      currentMsgId = genMsgId();
+      currentMsgContent = "";
+      msgContentEmitted = false;
+      out += emitEvent("response.output_item.added", {
+        type: "response.output_item.added",
+        output_index: outputIndex++,
+        item: { id: currentMsgId, type: "message", status: "in_progress", role: "assistant", content: [] },
+      });
+    }
+    return out;
+  }
+
+  function closeMessageIfNeeded(): string {
+    let out = "";
+    if (currentMsgId !== null) {
+      if (msgContentEmitted) {
+        out += emitEvent("response.content_part.done", {
+          type: "response.content_part.done",
+          item_id: currentMsgId,
+          output_index: outputIndex - 1,
+          content_index: 0,
+          part: { type: "output_text", text: currentMsgContent },
+        });
+      }
+      out += emitEvent("response.output_item.done", {
+        type: "response.output_item.done",
+        output_index: outputIndex - 1,
+        item: {
+          id: currentMsgId, type: "message", status: "completed", role: "assistant",
+          content: [{ type: "output_text", text: currentMsgContent }],
+        },
+      });
+      completedItems.push({
+        id: currentMsgId, type: "message", status: "completed", role: "assistant",
+        content: [{ type: "output_text", text: currentMsgContent }],
+      });
+      currentMsgId = null;
+    }
+    return out;
+  }
+
+  function processChunk(json: Record<string, unknown>): string {
+    let out = "";
+
+    const choices = json.choices as Array<Record<string, unknown>> | undefined;
+    const choice = choices?.[0];
+    const delta = choice?.delta as Record<string, unknown> | undefined;
+    const finishReason = choice?.finish_reason as string | null | undefined;
+
+    // 首个 chunk：提取元信息 + 发 response.created
+    if (!responseId) {
+      responseId = String(json.id ?? "");
+      if (responseId.startsWith("chatcmpl-")) {
+        responseId = "resp-" + responseId.slice("chatcmpl-".length);
+      } else if (!responseId.startsWith("resp-")) {
+        responseId = "resp-" + responseId;
+      }
+      model = String(json.model ?? "");
+      createdAt = (json.created as number) ?? Math.floor(Date.now() / 1000);
+
+      out += emitEvent("response.created", {
+        type: "response.created",
+        response: {
+          id: responseId, object: "response", created_at: createdAt,
+          model, status: "in_progress", output: [],
+        },
+      });
+    }
+
+    if (!delta) return out;
+
+    // 处理 content delta
+    if (typeof delta.content === "string" && delta.content.length > 0) {
+      out += startMessageIfNeeded();
+      if (!msgContentEmitted) {
+        out += emitEvent("response.content_part.added", {
+          type: "response.content_part.added",
+          item_id: currentMsgId,
+          output_index: outputIndex - 1,
+          content_index: 0,
+          part: { type: "output_text", text: "" },
+        });
+        msgContentEmitted = true;
+      }
+      currentMsgContent += delta.content;
+      out += emitEvent("response.content_part.delta", {
+        type: "response.content_part.delta",
+        item_id: currentMsgId,
+        output_index: outputIndex - 1,
+        content_index: 0,
+        delta: delta.content,
+      });
+    }
+
+    // 处理 tool_calls delta
+    const toolCalls = delta.tool_calls as Array<Record<string, unknown>> | undefined;
+    if (Array.isArray(toolCalls) && toolCalls.length > 0) {
+      // 切换到 tool_calls 阶段：先关闭 message
+      if (!inToolCalls) {
+        inToolCalls = true;
+        out += closeMessageIfNeeded();
+      }
+
+      for (const tc of toolCalls) {
+        const idx = tc.index as number;
+        const existing = pendingToolCalls.get(idx);
+
+        if (!existing) {
+          // 新的 tool_call
+          const fn = tc.function as Record<string, unknown> | undefined;
+          const fcId = genFcId();
+          const tcId = String(tc.id ?? fcId);
+          const name = String(fn?.name ?? "");
+          const args = String(fn?.arguments ?? "");
+
+          // 分配固定 output_index
+          const tcOutIdx = tcOutputIdxCounter++;
+          tcOutputIndex.set(idx, tcOutIdx);
+          pendingToolCalls.set(idx, { id: tcId, name, arguments: args });
+
+          out += emitEvent("response.output_item.added", {
+            type: "response.output_item.added",
+            output_index: tcOutIdx,
+            item: { id: fcId, type: "function_call", status: "in_progress", call_id: tcId, name, arguments: "" },
+          });
+
+          if (args.length > 0) {
+            out += emitEvent("response.function_call_arguments.delta", {
+              type: "response.function_call_arguments.delta",
+              item_id: fcId,
+              output_index: tcOutIdx,
+              delta: args,
+            });
+          }
+        } else {
+          // 追加 arguments 到已有的 tool_call
+          const fn = tc.function as Record<string, unknown> | undefined;
+          const args = String(fn?.arguments ?? "");
+          if (args.length > 0) {
+            existing.arguments += args;
+            const tcOutIdx = tcOutputIndex.get(idx) ?? 0;
+            out += emitEvent("response.function_call_arguments.delta", {
+              type: "response.function_call_arguments.delta",
+              item_id: existing.id,
+              output_index: tcOutIdx,
+              delta: args,
+            });
+          }
+        }
+      }
+    }
+
+    // 处理 finish_reason
+    if (finishReason != null) {
+      // 关闭所有未完成的 item
+      out += closeMessageIfNeeded();
+
+      // 关闭所有 pending tool_calls
+      for (const [idx, tc] of pendingToolCalls) {
+        const fcId = tc.id;
+        const tcOutIdx = tcOutputIndex.get(idx) ?? idx;
+        out += emitEvent("response.function_call_arguments.done", {
+          type: "response.function_call_arguments.done",
+          output_index: tcOutIdx,
+          item: { id: fcId, type: "function_call", status: "completed", call_id: tc.id, name: tc.name, arguments: tc.arguments },
+        });
+        out += emitEvent("response.output_item.done", {
+          type: "response.output_item.done",
+          output_index: tcOutIdx,
+          item: { id: fcId, type: "function_call", status: "completed", call_id: tc.id, name: tc.name, arguments: tc.arguments },
+        });
+        completedItems.push({
+          id: fcId, type: "function_call", status: "completed", call_id: tc.id, name: tc.name, arguments: tc.arguments,
+        });
+      }
+      pendingToolCalls.clear();
+
+      // usage
+      const usage = json.usage as Record<string, unknown> | undefined;
+      const respUsage = usage ? {
+        input_tokens: usage.prompt_tokens ?? 0,
+        output_tokens: usage.completion_tokens ?? 0,
+        total_tokens: usage.total_tokens ?? 0,
+      } : { input_tokens: 0, output_tokens: 0, total_tokens: 0 };
+
+      const status = finishReason === "length" ? "incomplete" : "completed";
+
+      out += emitEvent("response.completed", {
+        type: "response.completed",
+        response: {
+          id: responseId, object: "response", created_at: createdAt,
+          model, status, output: completedItems, usage: respUsage,
+        },
+      });
+
+      out += "event: done\ndata: [DONE]\n\n";
+    }
+
+    return out;
+  }
+
+  return new TransformStream<Uint8Array, Uint8Array>({
+    transform(chunk, controller) {
+      buffer += decoder.decode(chunk, { stream: true });
+      const lines = buffer.split("\n");
+      buffer = lines.pop() ?? "";
+
+      for (const line of lines) {
+        const trimmed = line.trim();
+        if (!trimmed || trimmed.startsWith(":")) continue;
+        if (trimmed === "data: [DONE]") {
+          // 如果还没收到 finish_reason，强制 close
+          const flush = processChunk({ choices: [{ delta: {}, finish_reason: "stop" }] });
+          if (flush) controller.enqueue(encoder.encode(flush));
+          return;
+        }
+        if (trimmed.startsWith("data: ")) {
+          try {
+            const json = JSON.parse(trimmed.slice(6));
+            const out = processChunk(json);
+            if (out) controller.enqueue(encoder.encode(out));
+          } catch {
+            // skip malformed JSON
+          }
+        }
+      }
+    },
+    flush(controller) {
+      // 处理 buffer 中剩余数据
+      if (buffer.trim()) {
+        const trimmed = buffer.trim();
+        if (trimmed.startsWith("data: ") && trimmed !== "data: [DONE]") {
+          try {
+            const json = JSON.parse(trimmed.slice(6));
+            const out = processChunk(json);
+            if (out) controller.enqueue(encoder.encode(out));
+          } catch {}
+        }
+      }
+      // 确保 stream 正常关闭
+    },
+  });
 }
 
 /** 把多个变换函数串联成一个 */
