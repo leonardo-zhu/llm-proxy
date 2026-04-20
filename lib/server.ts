@@ -58,12 +58,24 @@ export function startProxy(config: ServerConfig) {
       try {
         body = await req.json();
       } catch {}
+      // 写入 debug log 文件，不污染终端
+      try {
+        const { appendFileSync, mkdirSync } = await import("fs");
+        mkdirSync("logs", { recursive: true });
+        appendFileSync("logs/proxy-debug.log",
+          `\n${"=".repeat(80)}\n[${new Date().toISOString()}] ${req.method} ${url.pathname}\n\n--- INCOMING ---\n${JSON.stringify(body, null, 2)}\n`);
+      } catch {}
 
       if (route.transform) body = route.transform(body);
 
       const subPath = route.targetPath ?? (url.pathname.slice(route.prefix.length) || "/");
       const target = route.targetBaseUrl.replace(/\/$/, "") + subPath + url.search;
       console.log(`[proxy] → ${req.method} ${target} keys=${Object.keys(body).join(",")}`);
+      try {
+        const { appendFileSync } = await import("fs");
+        appendFileSync("logs/proxy-debug.log",
+          `\n--- AFTER TRANSFORM ---\n${JSON.stringify(body, null, 2)}\n`);
+      } catch {}
 
       try {
         const resp = await fetch(target, {
@@ -92,9 +104,26 @@ export function startProxy(config: ServerConfig) {
 
         // 非流式响应：JSON body 转换
         const respBody = await resp.json();
+        try {
+          const { appendFileSync } = await import("fs");
+          appendFileSync("logs/proxy-debug.log",
+            `\n--- RESPONSE status=${resp.status} ---\n${JSON.stringify(respBody, null, 2)}\n`);
+        } catch {}
+        console.log(`[proxy] ← status=${resp.status}`);
+
+        // 上游报错 → 直接透传，不做格式转换
+        if (resp.status >= 400) {
+          return Response.json(respBody, { status: resp.status });
+        }
+
         const transformed = route.responseTransform
           ? route.responseTransform(respBody as Record<string, unknown>)
           : respBody;
+        try {
+          const { appendFileSync } = await import("fs");
+          appendFileSync("logs/proxy-debug.log",
+            `\n--- TRANSFORMED RESPONSE ---\n${JSON.stringify(transformed, null, 2)}\n`);
+        } catch {}
 
         return Response.json(transformed, {
           status: resp.status,

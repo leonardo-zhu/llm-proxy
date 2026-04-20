@@ -147,10 +147,11 @@ export function responsesToChat(): Transform {
     }
 
     const messages: unknown[] = [];
+    const systemParts: string[] = [];
 
-    // instructions → system message（放最前面）
+    // instructions → 收集为 system
     if (instructions) {
-      messages.push({ role: "system", content: instructions });
+      systemParts.push(instructions);
     }
 
     for (const item of inputItems) {
@@ -173,13 +174,22 @@ export function responsesToChat(): Transform {
           content: typeof it.output === "string" ? it.output : JSON.stringify(it.output),
         });
       } else if (it.type === "message" || it.role != null) {
-        // 只处理有 role 的普通消息，跳过 reasoning 等无关 item
         const role = it.role === "developer" ? "system" : it.role;
         const content = normalizeContent(it.content);
         if (content !== "" && content != null) {
-          messages.push({ role, content });
+          // system 消息合并成一条（MiniMax 等后端不支持多条 system）
+          if (role === "system") {
+            systemParts.push(typeof content === "string" ? content : JSON.stringify(content));
+          } else {
+            messages.push({ role, content });
+          }
         }
       }
+    }
+
+    // 合并 system 消息放在最前面
+    if (systemParts.length > 0) {
+      messages.unshift({ role: "system", content: systemParts.join("\n\n") });
     }
 
     result.messages = messages;
