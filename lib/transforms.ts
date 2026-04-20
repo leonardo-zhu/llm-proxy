@@ -60,16 +60,6 @@ export function fillInputItemStatus(defaultStatus = "completed"): Transform {
   };
 }
 
-function normalizeContent(content: unknown): unknown {
-  if (!Array.isArray(content)) return content;
-  const TEXT_TYPES = new Set(["text", "input_text", "output_text"]);
-  const textPart = content.find(
-    (p): p is Record<string, unknown> =>
-      typeof p === "object" && p !== null && TEXT_TYPES.has((p as Record<string, unknown>).type as string)
-  );
-  return textPart?.text ?? "";
-}
-
 /**
  * content parts → text string（保留多模态时返回 array）
  * Responses API: [{type:"input_text"|"output_text"|"text", text:"..."}, ...]
