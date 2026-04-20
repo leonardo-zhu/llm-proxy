@@ -60,23 +60,91 @@ export function fillInputItemStatus(defaultStatus = "completed"): Transform {
   };
 }
 
-/**
- * Chat Completions 格式 → Responses API 格式
- * { messages: [{role, content}] } → { input: [{type, role, content, status}] }
- */
-export function chatToResponses(): Transform {
-  return (body) => {
-    const { messages, ...rest } = body as { messages?: unknown[] } & Body;
-    if (!Array.isArray(messages)) return body;
+function normalizeContent(content: unknown): unknown {
+  if (!Array.isArray(content)) return content;
+  const TEXT_TYPES = new Set(["text", "input_text", "output_text"]);
+  const textPart = content.find(
+    (p): p is Record<string, unknown> =>
+      typeof p === "object" && p !== null && TEXT_TYPES.has((p as Record<string, unknown>).type as string)
+  );
+  return textPart?.text ?? "";
+}
 
-    return {
-      ...rest,
-      input: messages.map((msg) => {
-        if (typeof msg !== "object" || msg === null) return msg;
-        const { role, content } = msg as Record<string, unknown>;
-        return { type: "message", role, content, status: "completed" };
-      }),
-    };
+/**
+ * Responses API 格式 → Chat Completions 格式
+ *
+ * 差异处理：
+ * - input[] → messages[]
+ * - role "developer" → "system"
+ * - content array of parts → string
+ * - type "function_call" item → assistant message with tool_calls
+ * - type "function_call_output" item → tool role message
+ * - instructions 顶层字段 → 插入 system message
+ * - tools: {type,name,description,parameters} → {type,function:{name,description,parameters}}
+ * - max_output_tokens → max_tokens
+ */
+export function responsesToChat(): Transform {
+  return (body) => {
+    const { input, instructions, tools, max_output_tokens, ...rest } =
+      body as Body & { input?: unknown[]; instructions?: string; tools?: unknown[]; max_output_tokens?: number };
+
+    const result: Body = { ...rest };
+
+    // max_output_tokens → max_tokens
+    if (max_output_tokens != null) result.max_tokens = max_output_tokens;
+
+    // tools 格式转换
+    if (Array.isArray(tools) && tools.length > 0) {
+      result.tools = tools.map((t) => {
+        if (typeof t !== "object" || t === null) return t;
+        const { type, name, description, parameters } = t as Record<string, unknown>;
+        if (type === "function") {
+          return { type: "function", function: { name, description, parameters } };
+        }
+        return t;
+      });
+    }
+
+    if (!Array.isArray(input)) return result;
+
+    const messages: unknown[] = [];
+
+    // instructions → system message（放最前面）
+    if (instructions) {
+      messages.push({ role: "system", content: instructions });
+    }
+
+    for (const item of input) {
+      if (typeof item !== "object" || item === null) continue;
+      const it = item as Record<string, unknown>;
+
+      if (it.type === "function_call") {
+        messages.push({
+          role: "assistant",
+          tool_calls: [{
+            id: it.call_id ?? it.id,
+            type: "function",
+            function: { name: it.name, arguments: it.arguments },
+          }],
+        });
+      } else if (it.type === "function_call_output") {
+        messages.push({
+          role: "tool",
+          tool_call_id: it.call_id,
+          content: typeof it.output === "string" ? it.output : JSON.stringify(it.output),
+        });
+      } else if (it.type === "message" || it.role != null) {
+        // 只处理有 role 的普通消息，跳过 reasoning 等无关 item
+        const role = it.role === "developer" ? "system" : it.role;
+        const content = normalizeContent(it.content);
+        if (content !== "" && content != null) {
+          messages.push({ role, content });
+        }
+      }
+    }
+
+    result.messages = messages;
+    return result;
   };
 }
 

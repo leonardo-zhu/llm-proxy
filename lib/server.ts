@@ -14,7 +14,8 @@ export interface ProxyRoute {
   prefix: string;
   targetBaseUrl: string;
   apiKey: string;
-  /** 转发前对请求体做的变换 */
+  /** 固定转发到指定路径，不设则剥掉前缀后原样转发 */
+  targetPath?: string;
   transform?: Transform;
 }
 
@@ -37,7 +38,6 @@ export function startProxy(config: ServerConfig) {
         return Response.json({ status: "ok", timestamp: new Date().toISOString() });
       }
 
-      // 找最长匹配的路由前缀
       const route = routes
         .filter((r) => url.pathname.startsWith(r.prefix))
         .sort((a, b) => b.prefix.length - a.prefix.length)[0];
@@ -57,10 +57,9 @@ export function startProxy(config: ServerConfig) {
 
       if (route.transform) body = route.transform(body);
 
-      // 剥掉路由前缀，拼接目标 URL
-      const subPath = url.pathname.slice(route.prefix.length) || "/";
+      const subPath = route.targetPath ?? (url.pathname.slice(route.prefix.length) || "/");
       const target = route.targetBaseUrl.replace(/\/$/, "") + subPath + url.search;
-      console.log(`[proxy] → ${req.method} ${target}`);
+      console.log(`[proxy] → ${req.method} ${target} keys=${Object.keys(body).join(",")}`);
 
       try {
         const resp = await fetch(target, {
@@ -87,6 +86,6 @@ export function startProxy(config: ServerConfig) {
 
   console.log(`✅ 代理启动在 http://127.0.0.1:${server.port}`);
   for (const r of routes) {
-    console.log(`   ${r.prefix}  →  ${r.targetBaseUrl}`);
+    console.log(`   ${r.prefix}  →  ${r.targetBaseUrl}${r.targetPath ?? ""}`);
   }
 }
