@@ -198,7 +198,17 @@ export function responsesToChat(): Transform {
 }
 
 /**
- * Chat Completions 格式 → Responses API 格式（非流式）
+/** 从 content 中提取 `<think>` 推理标签，返回 {reasoning, visible} */
+function extractThinkTags(content: string): { reasoning: string | null; visible: string } {
+  const thinkMatch = content.match(/<think>([\s\S]*?)<\/think>/);
+  if (!thinkMatch) return { reasoning: null, visible: content };
+  const reasoning = thinkMatch[1].trim();
+  // 移除 think 标签及其前后的多余空行
+  const visible = content.replace(/<think>[\s\S]*?<\/think>\n?/, "").trim();
+  return { reasoning, visible };
+}
+
+/** Chat Completions 格式 → Responses API 格式（非流式）
  *
  * - choices[0].message.content → output[] message item
  * - choices[0].message.tool_calls → output[] function_call items
@@ -226,17 +236,34 @@ export function chatToResponses(): Transform {
     let fcIdx = 0;
 
     if (message) {
-      // content → message item
+      // content → message item（提取 think 推理标签）
       const content = message.content;
       if (content != null && content !== "") {
         const contentText = typeof content === "string" ? content : JSON.stringify(content);
-        output.push({
-          id: `msg-${respId}-${msgIdx++}`,
-          type: "message",
-          status: "completed",
-          role: "assistant",
-          content: [{ type: "output_text", text: contentText }],
-        });
+        const { reasoning, visible } = typeof content === "string"
+          ? extractThinkTags(contentText)
+          : { reasoning: null, visible: contentText };
+
+        // reasoning → 单独的 message item（role=assistant, type=reasoning）
+        if (reasoning) {
+          output.push({
+            id: `rsn-${respId}-${msgIdx++}`,
+            type: "reasoning",
+            status: "completed",
+            content: reasoning,
+          });
+        }
+
+        // 可见内容 → message item
+        if (visible) {
+          output.push({
+            id: `msg-${respId}-${msgIdx++}`,
+            type: "message",
+            status: "completed",
+            role: "assistant",
+            content: [{ type: "output_text", text: visible }],
+          });
+        }
       }
 
       // tool_calls → function_call items
@@ -298,6 +325,10 @@ export function createChatToResponsesSSETransformer(): TransformStream<Uint8Arra
   let buffer = "";
   let outputIndex = 0;
   let inToolCalls = false;
+  let inThinkTag = false;        // 是否在 `<think>` 标签内
+  let thinkItemId: string | null = null;  // 当前 reasoning item 的 ID
+  let thinkContent = "";         // 累积的推理内容
+  let thinkEmitted = false;      // 是否已发过 reasoning item start
 
   // 追踪并行 tool_calls: index → {id, name, arguments}
   const pendingToolCalls = new Map<number, { id: string; name: string; arguments: string }>();
@@ -396,27 +427,9 @@ export function createChatToResponsesSSETransformer(): TransformStream<Uint8Arra
 
     if (!delta) return out;
 
-    // 处理 content delta
+    // 处理 content delta（含 `<think>` 推理标签处理）
     if (typeof delta.content === "string" && delta.content.length > 0) {
-      out += startMessageIfNeeded();
-      if (!msgContentEmitted) {
-        out += emitEvent("response.content_part.added", {
-          type: "response.content_part.added",
-          item_id: currentMsgId,
-          output_index: outputIndex - 1,
-          content_index: 0,
-          part: { type: "output_text", text: "" },
-        });
-        msgContentEmitted = true;
-      }
-      currentMsgContent += delta.content;
-      out += emitEvent("response.content_part.delta", {
-        type: "response.content_part.delta",
-        item_id: currentMsgId,
-        output_index: outputIndex - 1,
-        content_index: 0,
-        delta: delta.content,
-      });
+      out += processContentWithThink(delta.content);
     }
 
     // 处理 tool_calls delta
@@ -479,6 +492,25 @@ export function createChatToResponsesSSETransformer(): TransformStream<Uint8Arra
 
     // 处理 finish_reason
     if (finishReason != null) {
+      // 关闭未完成的 reasoning item
+      if (inThinkTag && thinkEmitted && thinkItemId) {
+        out += emitEvent("reasoning_summary_text.done", {
+          type: "reasoning_summary_text.done",
+          item_id: thinkItemId,
+          output_index: outputIndex - 1,
+          content_index: 0,
+          text: thinkContent,
+        });
+        out += emitEvent("response.output_item.done", {
+          type: "response.output_item.done",
+          output_index: outputIndex - 1,
+          item: { id: thinkItemId, type: "reasoning", status: "completed", content: thinkContent },
+        });
+        completedItems.push({ id: thinkItemId, type: "reasoning", status: "completed", content: thinkContent });
+        inThinkTag = false;
+        thinkItemId = null;
+      }
+
       // 关闭所有未完成的 item
       out += closeMessageIfNeeded();
 
