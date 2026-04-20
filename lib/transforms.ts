@@ -6,12 +6,14 @@ export function stripTopLevel(blocklist: string[]): Transform {
   const set = new Set(blocklist);
   return (body) => {
     const result = { ...body };
+    const stripped: string[] = [];
     for (const key of set) {
       if (key in result) {
-        console.log(`[proxy] stripped top-level field: ${key}`);
+        stripped.push(key);
         delete result[key];
       }
     }
+    if (stripped.length > 0) console.log(`[proxy] stripped: ${stripped.join(", ")}`);
     return result;
   };
 }
@@ -325,10 +327,7 @@ export function createChatToResponsesSSETransformer(): TransformStream<Uint8Arra
   let buffer = "";
   let outputIndex = 0;
   let inToolCalls = false;
-  let inThinkTag = false;        // 是否在 `<think>` 标签内
-  let thinkItemId: string | null = null;  // 当前 reasoning item 的 ID
-  let thinkContent = "";         // 累积的推理内容
-  let thinkEmitted = false;      // 是否已发过 reasoning item start
+  let inThinkTag = false;        // 是否在 `<think>` 标签内（用于 strip）
 
   // 追踪并行 tool_calls: index → {id, name, arguments}
   const pendingToolCalls = new Map<number, { id: string; name: string; arguments: string }>();
@@ -427,7 +426,7 @@ export function createChatToResponsesSSETransformer(): TransformStream<Uint8Arra
     return e;
   }
 
-  /** 处理 content delta，检测 `<think>` 标签并分流到 reasoning / visible */
+  /** 处理 content delta，strip `<think>` 标签，只发 visible content */
   function processContentWithThink(text: string): string {
     let out = "";
     let content = (pendingTag ?? "") + text;
@@ -435,71 +434,19 @@ export function createChatToResponsesSSETransformer(): TransformStream<Uint8Arra
 
     while (content.length > 0) {
       if (inThinkTag) {
+        // 在 `<think>` 内 — 丢弃，找 `
         const closeIdx = content.indexOf("</think>");
         if (closeIdx !== -1) {
-          const reasoning = content.slice(0, closeIdx);
-          if (reasoning.length > 0) {
-            thinkContent += reasoning;
-            if (thinkEmitted && thinkItemId) {
-              out += emitEvent("reasoning_summary_text.delta", {
-                type: "reasoning_summary_text.delta",
-                item_id: thinkItemId,
-                output_index: outputIndex - 1,
-                content_index: 0,
-                delta: reasoning,
-              });
-            }
-          }
-          if (thinkEmitted && thinkItemId) {
-            out += emitEvent("reasoning_summary_text.done", {
-              type: "reasoning_summary_text.done",
-              item_id: thinkItemId,
-              output_index: outputIndex - 1,
-              content_index: 0,
-              text: thinkContent,
-            });
-            out += emitEvent("response.output_item.done", {
-              type: "response.output_item.done",
-              output_index: outputIndex - 1,
-              item: { id: thinkItemId, type: "reasoning", status: "completed", content: thinkContent },
-            });
-            completedItems.push({ id: thinkItemId, type: "reasoning", status: "completed", content: thinkContent });
-          }
           inThinkTag = false;
-          thinkItemId = null;
           content = content.slice(closeIdx + THINK_CLOSE.length);
         } else {
+          // 可能 `</think>` 被拆包 — 检查结尾
           let matched = false;
           for (let i = 1; i < THINK_CLOSE.length; i++) {
             if (content.endsWith(THINK_CLOSE.slice(0, i))) {
-              const safe = content.slice(0, -i);
-              if (safe.length > 0) {
-                thinkContent += safe;
-                if (thinkEmitted && thinkItemId) {
-                  out += emitEvent("reasoning_summary_text.delta", {
-                    type: "reasoning_summary_text.delta",
-                    item_id: thinkItemId,
-                    output_index: outputIndex - 1,
-                    content_index: 0,
-                    delta: safe,
-                  });
-                }
-              }
               pendingTag = content.slice(-i);
               matched = true;
               break;
-            }
-          }
-          if (!matched) {
-            thinkContent += content;
-            if (thinkEmitted && thinkItemId) {
-              out += emitEvent("reasoning_summary_text.delta", {
-                type: "reasoning_summary_text.delta",
-                item_id: thinkItemId,
-                output_index: outputIndex - 1,
-                content_index: 0,
-                delta: content,
-              });
             }
           }
           content = "";
@@ -510,17 +457,9 @@ export function createChatToResponsesSSETransformer(): TransformStream<Uint8Arra
           const visible = content.slice(0, openIdx);
           if (visible.length > 0) out += emitVisibleDelta(visible);
           inThinkTag = true;
-          thinkItemId = `rsn-${responseId}-${msgCounter++}`;
-          thinkContent = "";
-          thinkEmitted = false;
-          out += emitEvent("response.output_item.added", {
-            type: "response.output_item.added",
-            output_index: outputIndex++,
-            item: { id: thinkItemId, type: "reasoning", status: "in_progress", content: "" },
-          });
-          thinkEmitted = true;
           content = content.slice(openIdx + THINK_OPEN.length);
         } else {
+          // 检查是否以 `<think>` 前缀结尾
           let matched = false;
           for (let i = 1; i < THINK_OPEN.length; i++) {
             if (content.endsWith(THINK_OPEN.slice(0, i))) {
@@ -634,25 +573,6 @@ export function createChatToResponsesSSETransformer(): TransformStream<Uint8Arra
 
     // 处理 finish_reason
     if (finishReason != null) {
-      // 关闭未完成的 reasoning item
-      if (inThinkTag && thinkEmitted && thinkItemId) {
-        out += emitEvent("reasoning_summary_text.done", {
-          type: "reasoning_summary_text.done",
-          item_id: thinkItemId,
-          output_index: outputIndex - 1,
-          content_index: 0,
-          text: thinkContent,
-        });
-        out += emitEvent("response.output_item.done", {
-          type: "response.output_item.done",
-          output_index: outputIndex - 1,
-          item: { id: thinkItemId, type: "reasoning", status: "completed", content: thinkContent },
-        });
-        completedItems.push({ id: thinkItemId, type: "reasoning", status: "completed", content: thinkContent });
-        inThinkTag = false;
-        thinkItemId = null;
-      }
-
       // 关闭所有未完成的 item
       out += closeMessageIfNeeded();
 
