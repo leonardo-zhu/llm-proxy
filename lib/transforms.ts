@@ -71,17 +71,46 @@ function normalizeContent(content: unknown): unknown {
 }
 
 /**
+ * content parts → text string（保留多模态时返回 array）
+ * Responses API: [{type:"input_text"|"output_text"|"text", text:"..."}, ...]
+ * Chat API:      "..." (纯文本) 或 [{type:"text",text:"..."},{type:"image_url",...}] (多模态)
+ */
+function normalizeContent(content: unknown): unknown {
+  if (!Array.isArray(content)) return content;
+  const TEXT_TYPES = new Set(["text", "input_text", "output_text"]);
+  const allText = content.every(
+    (p): p is Record<string, unknown> =>
+      typeof p === "object" && p !== null && TEXT_TYPES.has((p as Record<string, unknown>).type as string),
+  );
+  // 全是文本 → flatten 成 string
+  if (allText) {
+    return content.map((p) => (p as Record<string, unknown>).text ?? "").join("");
+  }
+  // 含 image 等非文本 → 保留 array，转成 Chat API 的 content part 格式
+  return content.map((p) => {
+    if (typeof p !== "object" || p === null) return p;
+    const part = p as Record<string, unknown>;
+    if (TEXT_TYPES.has(part.type as string)) {
+      return { type: "text", text: part.text ?? "" };
+    }
+    // image_url, input_audio 等直接透传
+    return part;
+  });
+}
+
+/**
  * Responses API 格式 → Chat Completions 格式
  *
  * 差异处理：
- * - input[] → messages[]
+ * - input (string | array) → messages[]
  * - role "developer" → "system"
- * - content array of parts → string
+ * - content array of parts → string（纯文本）或 array（多模态）
  * - type "function_call" item → assistant message with tool_calls
  * - type "function_call_output" item → tool role message
  * - instructions 顶层字段 → 插入 system message
  * - tools: {type,name,description,parameters} → {type,function:{name,description,parameters}}
  * - max_output_tokens → max_tokens
+ * - text.format → response_format
  */
 export function responsesToChat(): Transform {
   return (body) => {
