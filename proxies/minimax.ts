@@ -1,4 +1,4 @@
-import { compose, stripTopLevel, filterTools, fillInputItemStatus, responsesToChat, chatToResponses, createChatToResponsesSSETransformer } from "../lib/transforms.ts";
+import { compose, stripTopLevel, filterTools, fillInputItemStatus, responsesToChat, chatToResponses, extractMiniMaxThinkTags, createChatToResponsesSSETransformer } from "../lib/transforms.ts";
 import { requireEnv } from "../lib/server.ts";
 import type { ProxyRoute } from "../lib/server.ts";
 
@@ -14,6 +14,6 @@ export const route: ProxyRoute = {
     fillInputItemStatus(),
     responsesToChat(),
   ),
-  responseTransform: chatToResponses(),
+  responseTransform: compose(chatToResponses(), extractMiniMaxThinkTags()),
   streamTransformer: createChatToResponsesSSETransformer,
 };

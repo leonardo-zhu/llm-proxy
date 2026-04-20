@@ -238,34 +238,17 @@ export function chatToResponses(): Transform {
     let fcIdx = 0;
 
     if (message) {
-      // content → message item（提取 think 推理标签）
+      // content → message item
       const content = message.content;
       if (content != null && content !== "") {
         const contentText = typeof content === "string" ? content : JSON.stringify(content);
-        const { reasoning, visible } = typeof content === "string"
-          ? extractThinkTags(contentText)
-          : { reasoning: null, visible: contentText };
-
-        // reasoning → 单独的 message item（role=assistant, type=reasoning）
-        if (reasoning) {
-          output.push({
-            id: `rsn-${respId}-${msgIdx++}`,
-            type: "reasoning",
-            status: "completed",
-            content: reasoning,
-          });
-        }
-
-        // 可见内容 → message item
-        if (visible) {
-          output.push({
-            id: `msg-${respId}-${msgIdx++}`,
-            type: "message",
-            status: "completed",
-            role: "assistant",
-            content: [{ type: "output_text", text: visible }],
-          });
-        }
+        output.push({
+          id: `msg-${respId}-${msgIdx++}`,
+          type: "message",
+          status: "completed",
+          role: "assistant",
+          content: [{ type: "output_text", text: contentText }],
+        });
       }
 
       // tool_calls → function_call items
@@ -309,6 +292,51 @@ export function chatToResponses(): Transform {
       output,
       ...(respUsage ? { usage: respUsage } : {}),
     };
+  };
+}
+
+/**
+ * MiniMax 特有：从 Responses API output 中提取 think 推理标签为独立 reasoning item
+ * 作为独立 transform 使用：compose(chatToResponses(), extractMiniMaxThinkTags())
+ */
+export function extractMiniMaxThinkTags(): Transform {
+  return (body) => {
+    const output = body.output as Array<Record<string, unknown>> | undefined;
+    if (!Array.isArray(output)) return body;
+
+    const newOutput: Record<string, unknown>[] = [];
+    for (const item of output) {
+      if (item.type !== "message") {
+        newOutput.push(item);
+        continue;
+      }
+      const content = item.content as Array<Record<string, unknown>> | undefined;
+      const textPart = content?.find(
+        (p) => p.type === "output_text" || p.type === "text"
+      );
+      const text = textPart?.text as string | undefined;
+      if (!text) {
+        newOutput.push(item);
+        continue;
+      }
+      const { reasoning, visible } = extractThinkTags(text);
+      if (reasoning) {
+        newOutput.push({
+          id: `rsn-${String(item.id ?? "").replace(/^msg-/, "")}`,
+          type: "reasoning",
+          status: "completed",
+          content: reasoning,
+        });
+      }
+      if (visible) {
+        newOutput.push({
+          ...item,
+          content: [{ type: "output_text", text: visible }],
+        });
+      }
+    }
+
+    return { ...body, output: newOutput };
   };
 }
 
