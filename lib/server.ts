@@ -1,5 +1,14 @@
 import type { Transform } from "./transforms.ts";
 
+export function requireEnv(key: string): string {
+  const val = process.env[key];
+  if (!val) {
+    console.error(`❌ 请先设置环境变量 ${key}`);
+    process.exit(1);
+  }
+  return val;
+}
+
 export interface ProxyRoute {
   /** 匹配路径前缀，如 "/ark" */
   prefix: string;
