@@ -1,11 +1,19 @@
 /**
- * 火山方舟 Responses API 代理
- * 修正 Codex → 火山方舟的兼容性问题
+ * 火山方舟代理（单端口双路由）
+ *
+ *   /ark/*        直接转发 Responses API，修正 Codex 兼容性问题
+ *   /ark/chat/*   Chat Completions → Responses API 转换，再修正兼容性
  *
  * 运行：bun proxies/ark.ts
  */
 
-import { compose, stripTopLevel, filterTools, fillInputItemStatus } from "../lib/transforms.ts";
+import {
+  compose,
+  stripTopLevel,
+  filterTools,
+  fillInputItemStatus,
+  chatToResponses,
+} from "../lib/transforms.ts";
 import { startProxy } from "../lib/server.ts";
 
 const apiKey = process.env.ARK_API_KEY ?? "";
@@ -14,16 +22,30 @@ if (!apiKey) {
   process.exit(1);
 }
 
+const arkBase = process.env.ARK_BASE_URL ?? "https://ark.cn-beijing.volces.com/api/v3";
+
+// Codex → 火山方舟的通用修复
+const arkFixes = compose(
+  stripTopLevel(["client_metadata", "service_tier", "store", "metadata"]),
+  filterTools(["function", "code_interpreter", "retrieval"]),
+  fillInputItemStatus(),
+);
+
 startProxy({
   port: parseInt(process.env.ARK_PORT ?? "4000"),
-  targetBaseUrl: process.env.ARK_BASE_URL ?? "https://ark.cn-beijing.volces.com/api/v3",
-  apiKey,
-  transform: compose(
-    // Codex 发出但火山不认识的顶层字段
-    stripTopLevel(["client_metadata", "service_tier", "store", "metadata"]),
-    // web_search 故意不放行——Codex 格式里带有火山不认识的 external_web_access 字段
-    filterTools(["function", "code_interpreter", "retrieval"]),
-    // Codex 已知 bug：多轮对话历史 item 缺少 status 字段
-    fillInputItemStatus(),
-  ),
+  routes: [
+    {
+      // 必须放在 /ark 前面，前缀越长优先级越高（server.ts 已处理）
+      prefix: "/ark/chat",
+      targetBaseUrl: arkBase,
+      apiKey,
+      transform: compose(chatToResponses(), arkFixes),
+    },
+    {
+      prefix: "/ark",
+      targetBaseUrl: arkBase,
+      apiKey,
+      transform: arkFixes,
+    },
+  ],
 });

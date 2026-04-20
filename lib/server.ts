@@ -1,16 +1,21 @@
 import type { Transform } from "./transforms.ts";
 
-export interface ProxyConfig {
-  port: number;
+export interface ProxyRoute {
+  /** 匹配路径前缀，如 "/ark" */
+  prefix: string;
   targetBaseUrl: string;
   apiKey: string;
-  /** 转发前对请求体做的变换，默认不变换 */
+  /** 转发前对请求体做的变换 */
   transform?: Transform;
 }
 
-export function startProxy(config: ProxyConfig) {
-  const { port, targetBaseUrl, apiKey, transform } = config;
-  const base = targetBaseUrl.replace(/\/$/, "");
+export interface ServerConfig {
+  port: number;
+  routes: ProxyRoute[];
+}
+
+export function startProxy(config: ServerConfig) {
+  const { port, routes } = config;
 
   const server = Bun.serve({
     port,
@@ -23,6 +28,15 @@ export function startProxy(config: ProxyConfig) {
         return Response.json({ status: "ok", timestamp: new Date().toISOString() });
       }
 
+      // 找最长匹配的路由前缀
+      const route = routes
+        .filter((r) => url.pathname.startsWith(r.prefix))
+        .sort((a, b) => b.prefix.length - a.prefix.length)[0];
+
+      if (!route) {
+        return Response.json({ error: "no route matched" }, { status: 404 });
+      }
+
       if (req.method === "GET") {
         return Response.json({ object: "list", data: [] });
       }
@@ -32,9 +46,11 @@ export function startProxy(config: ProxyConfig) {
         body = await req.json();
       } catch {}
 
-      if (transform) body = transform(body);
+      if (route.transform) body = route.transform(body);
 
-      const target = base + url.pathname + url.search;
+      // 剥掉路由前缀，拼接目标 URL
+      const subPath = url.pathname.slice(route.prefix.length) || "/";
+      const target = route.targetBaseUrl.replace(/\/$/, "") + subPath + url.search;
       console.log(`[proxy] → ${req.method} ${target}`);
 
       try {
@@ -42,7 +58,7 @@ export function startProxy(config: ProxyConfig) {
           method: "POST",
           headers: {
             "Content-Type": "application/json",
-            Authorization: `Bearer ${apiKey}`,
+            Authorization: `Bearer ${route.apiKey}`,
           },
           body: JSON.stringify(body),
         });
@@ -61,5 +77,7 @@ export function startProxy(config: ProxyConfig) {
   });
 
   console.log(`✅ 代理启动在 http://127.0.0.1:${server.port}`);
-  console.log(`   转发目标：${targetBaseUrl}`);
+  for (const r of routes) {
+    console.log(`   ${r.prefix}  →  ${r.targetBaseUrl}`);
+  }
 }

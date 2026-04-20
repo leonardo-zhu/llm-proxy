@@ -60,6 +60,26 @@ export function fillInputItemStatus(defaultStatus = "completed"): Transform {
   };
 }
 
+/**
+ * Chat Completions 格式 → Responses API 格式
+ * { messages: [{role, content}] } → { input: [{type, role, content, status}] }
+ */
+export function chatToResponses(): Transform {
+  return (body) => {
+    const { messages, ...rest } = body as { messages?: unknown[] } & Body;
+    if (!Array.isArray(messages)) return body;
+
+    return {
+      ...rest,
+      input: messages.map((msg) => {
+        if (typeof msg !== "object" || msg === null) return msg;
+        const { role, content } = msg as Record<string, unknown>;
+        return { type: "message", role, content, status: "completed" };
+      }),
+    };
+  };
+}
+
 /** 把多个变换函数串联成一个 */
 export function compose(...transforms: Transform[]): Transform {
   return (body) => transforms.reduce((b, fn) => fn(b), body);
