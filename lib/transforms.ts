@@ -397,6 +397,148 @@ export function createChatToResponsesSSETransformer(): TransformStream<Uint8Arra
     return out;
   }
 
+  // `<think>` 标签检测状态
+  const THINK_OPEN = "<think>";
+  const THINK_CLOSE = "</think>";
+  let pendingTag: string | null = null;
+
+  /** 发射可见内容的 content_part delta */
+  function emitVisibleDelta(vt: string): string {
+    let e = "";
+    e += startMessageIfNeeded();
+    if (!msgContentEmitted) {
+      e += emitEvent("response.content_part.added", {
+        type: "response.content_part.added",
+        item_id: currentMsgId,
+        output_index: outputIndex - 1,
+        content_index: 0,
+        part: { type: "output_text", text: "" },
+      });
+      msgContentEmitted = true;
+    }
+    currentMsgContent += vt;
+    e += emitEvent("response.content_part.delta", {
+      type: "response.content_part.delta",
+      item_id: currentMsgId,
+      output_index: outputIndex - 1,
+      content_index: 0,
+      delta: vt,
+    });
+    return e;
+  }
+
+  /** 处理 content delta，检测 `<think>` 标签并分流到 reasoning / visible */
+  function processContentWithThink(text: string): string {
+    let out = "";
+    let content = (pendingTag ?? "") + text;
+    pendingTag = null;
+
+    while (content.length > 0) {
+      if (inThinkTag) {
+        const closeIdx = content.indexOf("</think>");
+        if (closeIdx !== -1) {
+          const reasoning = content.slice(0, closeIdx);
+          if (reasoning.length > 0) {
+            thinkContent += reasoning;
+            if (thinkEmitted && thinkItemId) {
+              out += emitEvent("reasoning_summary_text.delta", {
+                type: "reasoning_summary_text.delta",
+                item_id: thinkItemId,
+                output_index: outputIndex - 1,
+                content_index: 0,
+                delta: reasoning,
+              });
+            }
+          }
+          if (thinkEmitted && thinkItemId) {
+            out += emitEvent("reasoning_summary_text.done", {
+              type: "reasoning_summary_text.done",
+              item_id: thinkItemId,
+              output_index: outputIndex - 1,
+              content_index: 0,
+              text: thinkContent,
+            });
+            out += emitEvent("response.output_item.done", {
+              type: "response.output_item.done",
+              output_index: outputIndex - 1,
+              item: { id: thinkItemId, type: "reasoning", status: "completed", content: thinkContent },
+            });
+            completedItems.push({ id: thinkItemId, type: "reasoning", status: "completed", content: thinkContent });
+          }
+          inThinkTag = false;
+          thinkItemId = null;
+          content = content.slice(closeIdx + THINK_CLOSE.length);
+        } else {
+          let matched = false;
+          for (let i = 1; i < THINK_CLOSE.length; i++) {
+            if (content.endsWith(THINK_CLOSE.slice(0, i))) {
+              const safe = content.slice(0, -i);
+              if (safe.length > 0) {
+                thinkContent += safe;
+                if (thinkEmitted && thinkItemId) {
+                  out += emitEvent("reasoning_summary_text.delta", {
+                    type: "reasoning_summary_text.delta",
+                    item_id: thinkItemId,
+                    output_index: outputIndex - 1,
+                    content_index: 0,
+                    delta: safe,
+                  });
+                }
+              }
+              pendingTag = content.slice(-i);
+              matched = true;
+              break;
+            }
+          }
+          if (!matched) {
+            thinkContent += content;
+            if (thinkEmitted && thinkItemId) {
+              out += emitEvent("reasoning_summary_text.delta", {
+                type: "reasoning_summary_text.delta",
+                item_id: thinkItemId,
+                output_index: outputIndex - 1,
+                content_index: 0,
+                delta: content,
+              });
+            }
+          }
+          content = "";
+        }
+      } else {
+        const openIdx = content.indexOf("<think>");
+        if (openIdx !== -1) {
+          const visible = content.slice(0, openIdx);
+          if (visible.length > 0) out += emitVisibleDelta(visible);
+          inThinkTag = true;
+          thinkItemId = `rsn-${responseId}-${msgCounter++}`;
+          thinkContent = "";
+          thinkEmitted = false;
+          out += emitEvent("response.output_item.added", {
+            type: "response.output_item.added",
+            output_index: outputIndex++,
+            item: { id: thinkItemId, type: "reasoning", status: "in_progress", content: "" },
+          });
+          thinkEmitted = true;
+          content = content.slice(openIdx + THINK_OPEN.length);
+        } else {
+          let matched = false;
+          for (let i = 1; i < THINK_OPEN.length; i++) {
+            if (content.endsWith(THINK_OPEN.slice(0, i))) {
+              const safe = content.slice(0, -i);
+              if (safe.length > 0) out += emitVisibleDelta(safe);
+              pendingTag = content.slice(-i);
+              matched = true;
+              break;
+            }
+          }
+          if (!matched) out += emitVisibleDelta(content);
+          content = "";
+        }
+      }
+    }
+    return out;
+  }
+
   function processChunk(json: Record<string, unknown>): string {
     let out = "";
 
