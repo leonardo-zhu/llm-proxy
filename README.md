@@ -1,54 +1,103 @@
 # LLM Proxy
 
-基于 Bun 的 LLM API 代理服务。
+OpenAI Responses API ↔ Chat Completions API 双向协议转换代理。
 
-## 功能特性
+让只支持 Responses API 的客户端（如 Codex CLI）对接 Chat Completions 后端（如 MiniMax、火山方舟）。
 
-- 🚀 基于 Bun，超快启动
-- 🔐 环境变量配置
-- 🔄 OpenAI API 代理
-- 🩺 健康检查端点
+## 架构
+
+```
+Codex (Responses API)
+    │
+    ▼  request: Responses 格式
+┌───────────────────────────┐
+│       Proxy Server        │
+│  responsesToChat()        │  request → Chat 格式
+│  chatToResponses()        │  response → Responses 格式
+│  SSE stream transformer   │  流式事件转换
+└───────────────────────────┘
+    │
+    ▼  Chat Completions
+MiniMax / 火山方舟
+```
 
 ## 快速开始
 
 ### 1. 配置环境变量
 
-编辑 `.env` 文件，填入你的 API 密钥：
-
-```env
-PORT=3000
-OPENAI_API_KEY=sk-your-actual-api-key
-OPENAI_BASE_URL=https://api.openai.com/v1
+```bash
+cp .env.example .env
+# 编辑 .env，填入 API Key
 ```
 
-### 2. 启动服务
+### 2. 启动
 
 ```bash
-# 开发模式
-bun run dev
-
-# 生产模式
-bun run start
+bun run dev    # 热重载
+bun run start  # 生产模式
 ```
 
-## API 端点
+代理启动在 `http://127.0.0.1:4000`。
 
-- `GET /health` - 健康检查
-- `POST /v1/chat/completions` - 代理 OpenAI 聊天接口
-- `POST /v1/completions` - 代理 OpenAI 补全接口
-- 其他 `/v1/*` 端点也会被代理
+### 3. 配置 Codex
 
-## 使用示例
+将 base URL 设为 `http://127.0.0.1:4000/minimax`。
+
+## 路由
+
+| 路径 | 后端 | 说明 |
+|------|------|------|
+| `/minimax/*` | MiniMax | Responses ↔ Chat 双向转换 |
+| `/ark/*` | 火山方舟 | Responses API 原生透传 |
+
+## 协议转换
+
+### Request (Responses → Chat)
+
+- `input` (string \| array) → `messages[]`
+- `instructions` → system message（多条合并为一条）
+- `developer` role → `system` role
+- content parts array → string（纯文本）或 array（多模态）
+- `function_call` item → assistant `tool_calls`
+- `function_call_output` item → `role: "tool"` message
+- tools 格式：`{type,name,...}` → `{type,function:{name,...}}`
+- `max_output_tokens` → `max_tokens`
+- `text.format` → `response_format`
+
+### Response (Chat → Responses)
+
+- `choices[0].message.content` → `output[]` message item
+- `choices[0].message.tool_calls` → `output[]` function_call items
+- usage 字段映射
+- `<think>` 推理标签 → 独立 reasoning item（MiniMax 特有）
+
+### Stream (SSE)
+
+- Chat SSE delta events → Responses API SSE events
+- 自动 strip `<think>` 标签（流式）
+- 支持跨 chunk 的标签边界检测
+
+## 项目结构
+
+```
+lib/
+  transforms.ts      协议转换函数（通用）
+  server.ts          代理服务器
+
+proxies/
+  minimax.ts         MiniMax 路由 + think 标签处理（独有）
+  ark.ts             火山方舟路由
+
+docs/
+  responses-chat-conversion.md   设计文档
+```
+
+## 健康检查
 
 ```bash
-# 健康检查
-curl http://localhost:3000/health
-
-# 发送聊天请求
-curl http://localhost:3000/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "gpt-3.5-turbo",
-    "messages": [{"role": "user", "content": "Hello!"}]
-  }'
+curl http://localhost:4000/health
 ```
+
+## 调试
+
+请求/响应详情写入 `logs/proxy-debug.log`（自动创建，已在 .gitignore 中）。
