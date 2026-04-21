@@ -1,4 +1,5 @@
 import type { Transform } from "./transforms.ts";
+import { appendFileSync, mkdirSync } from "fs";
 
 export function requireEnv(key: string): string {
   const val = process.env[key];
@@ -60,7 +61,6 @@ export function startProxy(config: ServerConfig) {
       } catch {}
       // 写入 debug log 文件，不污染终端
       try {
-        const { appendFileSync, mkdirSync } = await import("fs");
         mkdirSync("logs", { recursive: true });
         appendFileSync("logs/proxy-debug.log",
           `\n${"=".repeat(80)}\n[${new Date().toISOString()}] ${req.method} ${url.pathname}\n\n--- INCOMING ---\n${JSON.stringify(body, null, 2)}\n`);
@@ -72,7 +72,6 @@ export function startProxy(config: ServerConfig) {
       const target = route.targetBaseUrl.replace(/\/$/, "") + subPath + url.search;
       console.log(`[proxy] → ${req.method} ${target} keys=${Object.keys(body).join(",")}`);
       try {
-        const { appendFileSync } = await import("fs");
         appendFileSync("logs/proxy-debug.log",
           `\n--- AFTER TRANSFORM ---\n${JSON.stringify(body, null, 2)}\n`);
       } catch {}
@@ -105,7 +104,6 @@ export function startProxy(config: ServerConfig) {
         // 非流式响应：JSON body 转换
         const respBody = await resp.json();
         try {
-          const { appendFileSync } = await import("fs");
           appendFileSync("logs/proxy-debug.log",
             `\n--- RESPONSE status=${resp.status} ---\n${JSON.stringify(respBody, null, 2)}\n`);
         } catch {}
@@ -120,7 +118,6 @@ export function startProxy(config: ServerConfig) {
           ? route.responseTransform(respBody as Record<string, unknown>)
           : respBody;
         try {
-          const { appendFileSync } = await import("fs");
           appendFileSync("logs/proxy-debug.log",
             `\n--- TRANSFORMED RESPONSE ---\n${JSON.stringify(transformed, null, 2)}\n`);
         } catch {}

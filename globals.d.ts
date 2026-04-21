@@ -20,3 +20,8 @@ declare var process: {
   env: NodeJS.ProcessEnv;
   exit(code?: number): never;
 };
+
+declare module "fs" {
+  export function appendFileSync(path: string, data: string): void;
+  export function mkdirSync(path: string, options?: { recursive?: boolean }): void;
+}
