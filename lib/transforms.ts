@@ -199,17 +199,6 @@ export function responsesToChat(): Transform {
   };
 }
 
-/**
-/** 从 content 中提取 `<think>` 推理标签，返回 {reasoning, visible} */
-function extractThinkTags(content: string): { reasoning: string | null; visible: string } {
-  const thinkMatch = content.match(/<think>([\s\S]*?)<\/think>/);
-  if (!thinkMatch) return { reasoning: null, visible: content };
-  const reasoning = thinkMatch[1].trim();
-  // 移除 think 标签及其前后的多余空行
-  const visible = content.replace(/<think>[\s\S]*?<\/think>\n?/, "").trim();
-  return { reasoning, visible };
-}
-
 /** Chat Completions 格式 → Responses API 格式（非流式）
  *
  * - choices[0].message.content → output[] message item
@@ -292,51 +281,6 @@ export function chatToResponses(): Transform {
       output,
       ...(respUsage ? { usage: respUsage } : {}),
     };
-  };
-}
-
-/**
- * MiniMax 特有：从 Responses API output 中提取 think 推理标签为独立 reasoning item
- * 作为独立 transform 使用：compose(chatToResponses(), extractMiniMaxThinkTags())
- */
-export function extractMiniMaxThinkTags(): Transform {
-  return (body) => {
-    const output = body.output as Array<Record<string, unknown>> | undefined;
-    if (!Array.isArray(output)) return body;
-
-    const newOutput: Record<string, unknown>[] = [];
-    for (const item of output) {
-      if (item.type !== "message") {
-        newOutput.push(item);
-        continue;
-      }
-      const content = item.content as Array<Record<string, unknown>> | undefined;
-      const textPart = content?.find(
-        (p) => p.type === "output_text" || p.type === "text"
-      );
-      const text = textPart?.text as string | undefined;
-      if (!text) {
-        newOutput.push(item);
-        continue;
-      }
-      const { reasoning, visible } = extractThinkTags(text);
-      if (reasoning) {
-        newOutput.push({
-          id: `rsn-${String(item.id ?? "").replace(/^msg-/, "")}`,
-          type: "reasoning",
-          status: "completed",
-          content: reasoning,
-        });
-      }
-      if (visible) {
-        newOutput.push({
-          ...item,
-          content: [{ type: "output_text", text: visible }],
-        });
-      }
-    }
-
-    return { ...body, output: newOutput };
   };
 }
 
