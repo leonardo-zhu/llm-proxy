@@ -33,8 +33,7 @@ cp .env.example .env
 ### 2. 启动
 
 ```bash
-bun run dev    # 热重载
-bun run start  # 生产模式
+bun run index.ts
 ```
 
 代理启动在 `http://127.0.0.1:4000`。
