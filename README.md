@@ -27,8 +27,14 @@ MiniMax / 火山方舟
 
 ```bash
 cp .env.example .env
-# 编辑 .env，填入 API Key
 ```
+
+需要配置的 Key（按需填，不配的后端不可用）：
+
+- `MINIMAX_API_KEY` — MiniMax
+- `ARK_API_KEY` — 火山方舟
+
+端口硬编码为 `4000`（见 `index.ts`）。
 
 ### 2. 启动
 
@@ -46,8 +52,8 @@ bun run index.ts
 
 | 路径 | 后端 | 说明 |
 |------|------|------|
-| `/minimax/*` | MiniMax | Responses ↔ Chat 双向转换 |
-| `/ark/*` | 火山方舟 | Responses API 原生透传 |
+| `/minimax/*` | MiniMax | 请求/响应双向转换 + think 标签处理 |
+| `/ark/*` | 火山方舟 | 请求侧 strip/fillInputItemStatus，响应透传 |
 
 ## 协议转换
 
@@ -79,6 +85,9 @@ bun run index.ts
 ## 项目结构
 
 ```
+index.ts             入口，启动代理
+globals.d.ts         Bun / Node 全局类型声明
+
 lib/
   transforms.ts      协议转换函数（通用）
   server.ts          代理服务器
