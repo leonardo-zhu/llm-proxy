@@ -33,6 +33,7 @@ cp .env.example .env
 
 - `MINIMAX_API_KEY` — MiniMax
 - `ARK_API_KEY` — 火山方舟
+- `NOUS_API_KEY` — NousResearch
 
 端口硬编码为 `4000`（见 `index.ts`）。
 
@@ -54,6 +55,7 @@ bun run index.ts
 |------|------|------|
 | `/minimax/*` | MiniMax | 请求/响应双向转换 + think 标签处理 |
 | `/ark/*` | 火山方舟 | 请求侧 strip/fillInputItemStatus，响应透传 |
+| `/nous/*` | NousResearch | 请求/响应双向转换 |
 
 ## 协议转换
 
@@ -95,6 +97,7 @@ lib/
 proxies/
   minimax.ts         MiniMax 路由 + think 标签处理（独有）
   ark.ts             火山方舟路由
+  nous.ts            NousResearch 路由
 
 docs/
   responses-chat-conversion.md   设计文档
