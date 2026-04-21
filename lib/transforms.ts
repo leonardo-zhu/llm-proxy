@@ -300,6 +300,8 @@ export function createChatToResponsesSSETransformer(): TransformStream<Uint8Arra
   let outputIndex = 0;
   let inToolCalls = false;
   let inThinkTag = false;        // 是否在 `<think>` 标签内（用于 strip）
+  let finished = false;          // 是否已处理过 finish_reason，防止重复发 response.completed
+  let doneReceived = false;      // 是否已收到上游 [DONE]
 
   // 追踪并行 tool_calls: index → {id, name, arguments}
   const pendingToolCalls = new Map<number, { id: string; name: string; arguments: string }>();
@@ -544,7 +546,8 @@ export function createChatToResponsesSSETransformer(): TransformStream<Uint8Arra
     }
 
     // 处理 finish_reason
-    if (finishReason != null) {
+    if (finishReason != null && !finished) {
+      finished = true;
       // 关闭所有未完成的 item
       out += closeMessageIfNeeded();
 
@@ -602,9 +605,14 @@ export function createChatToResponsesSSETransformer(): TransformStream<Uint8Arra
         const trimmed = line.trim();
         if (!trimmed || trimmed.startsWith(":")) continue;
         if (trimmed === "data: [DONE]") {
+          doneReceived = true;
           // 如果还没收到 finish_reason，强制 close
-          const flush = processChunk({ choices: [{ delta: {}, finish_reason: "stop" }] });
-          if (flush) controller.enqueue(encoder.encode(flush));
+          if (!finished) {
+            const flush = processChunk({ choices: [{ delta: {}, finish_reason: "stop" }] });
+            if (flush) controller.enqueue(encoder.encode(flush));
+          }
+          // 确保发 [DONE] 标记
+          controller.enqueue(encoder.encode("event: done\ndata: [DONE]\n\n"));
           return;
         }
         if (trimmed.startsWith("data: ")) {
@@ -630,7 +638,14 @@ export function createChatToResponsesSSETransformer(): TransformStream<Uint8Arra
           } catch {}
         }
       }
-      // 确保 stream 正常关闭
+      // 兜底：如果上游断连没发 [DONE]，强制发 completion + [DONE]
+      if (!doneReceived) {
+        if (!finished) {
+          const flush = processChunk({ choices: [{ delta: {}, finish_reason: "stop" }] });
+          if (flush) controller.enqueue(encoder.encode(flush));
+        }
+        controller.enqueue(encoder.encode("event: done\ndata: [DONE]\n\n"));
+      }
     },
   });
 }
